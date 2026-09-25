@@ -208,7 +208,10 @@ separate Python environment that the server only ever launches as a subprocess.
 file list with `hf download <repo> <files> --revision <commit>`, and everything afterwards resolves a
 snapshot with `snapshot_download(..., local_files_only=True, revision=<commit>)` through
 `yue2_common.resolve()`. The pins (from the YuE uv skill) are: YuE2-3B `1a96eca6`, YuE2-Vae `95535e72`,
-SheetSage2 `eab522a8`, MERT-v2-FullSong `d8ba1c74`; YuE2-Vae-legacy has no recorded pin and uses `main`.
+SheetSage2 `eab522a8`, MERT-v2-FullSong `d8ba1c74`; YuE2-Vae-legacy has no pin in the YuE skills, so it is
+pinned to the Hub's `main` as of 2026-09-25, `5ddd12f7`. `setup.sh --import <dir>` hard-links snapshots
+downloaded with `hf download --local-dir` (the `../YuE/models` layout) into the cache, verifying each file's
+recorded commit against the pin; the four snapshots on this machine were imported that way.
 
 ## 4. Dependencies
 
@@ -369,6 +372,24 @@ Loading SheetSage2 and MERT per job costs tens of seconds; measured `load_s` and
 the ETA the same way generation timings do. The environment is built once by `setup.sh` (`uv sync
 --script workers/transcribe.py --locked`), so per-job startup is Python import time, not package install.
 
+### 5.7 Lyrics recognition worker (Qwen3-ASR as a subprocess)
+
+Why Qwen3-ASR-1.7B: WildSongBench's own PER evaluator is built on it, and its technical report shows the
+best published results on sung-lyrics sets (M4Singer 5.98, MIR-1k-vocal 6.25, Opencpop 3.08, Popcs 8.52 WER)
+and full songs with backing (EntireSongs en 14.6 / zh 13.9), where Whisper-large-v3 degrades. Apache 2.0,
+52 languages, 2B params in bf16 (~4.7 GB), released 2026-01-29; pinned to Hub main of 2026-09-25,
+`7278e1e7`. The general-speech leaderboard leaders (Granite Speech, Canary-Qwen) are not trained for
+singing and are not multilingual in the way a Mandarin/English lyric-translation check needs.
+
+`qwen-asr` 0.0.6 pins `accelerate==1.12.0` while `yue2-infer` pins 1.13.0, so it cannot share the server
+process. `workers/lyrics.py` (PEP 723, locked: qwen-asr, torch 2.10 cu128, g2p_en, pypinyin) runs through
+the same `_run_worker` path as SheetSage2: MoT offloaded, `loading` until `model_provenance.json`, then
+`recognizing`, SIGTERM on cancel, manifest on success. Input is either the uploaded file or `source_job`'s
+`audio.flac`. Scoring is the worker's documented recipe (normalize, units, ARPAbet / pinyin phonemes,
+Levenshtein), reported per pass with the lowest-PER pass selected, mirroring the benchmark's best-of-N
+shape without claiming its undisclosed evaluator. `setup.sh` fetches the nltk data g2p_en needs
+(`lyrics.py --prepare`) so the worker runs offline.
+
 ## 6. HTTP API
 
 Four operations cover every workflow in the agent skill. JSON tasks go through `POST /jobs` with a `task`
@@ -381,6 +402,7 @@ are long-running GPU jobs that share one queue, and the client side never needs 
 | `generate` | text → audio, or ABC → audio | style, lyrics, `cot`, optional `abc` | `audio.flac` plus score and artifacts | 2 |
 | `decode` | latents → audio again | `source_job`, `vae=standard\|legacy` | new `audio.flac` + full artifact set, latents unchanged | 6 |
 | `transcribe` | audio → ABC | multipart audio file, `task=full\|melody-full\|melody-vocal`, `preset`, `max_seconds`, `dtype` | `score.abc`, MIDI, LAB annotations, `transcription_manifest.json` | 5, subprocess |
+| `lyrics` | audio → sung-lyrics transcript, scored | `source_job` or multipart audio; `lyrics` reference, `language`, `passes` | `transcript.txt`, `lyrics_asr.json` (WER/CER, PER per pass), `lyrics_manifest.json` | 5b, subprocess |
 
 `cot=off` has no score, so text → ABC exists only for `full` and `melody`; `generate` with `cot=off` is a
 pure text → audio call. ABC tooling (chord stripping, invariant checks, comparisons) ships with the skill's
@@ -516,6 +538,14 @@ VAE 6 ms per token, SheetSage2 load ~9 s then ~0.16 s per audio second; a full 5
   `score.abc`; a generate job submitted right after it runs without OOM; the cover round-trip (transcribe →
   strip chords → generate with `cot: melody`) produces audio.
 
+**Phase 5b: lyrics recognition** (half a day; done)
+- `workers/lyrics.py`, `task: lyrics` via JSON (`source_job`) and `POST /jobs/lyrics` (upload), skill client
+  `scripts/lyrics.py`, fake-worker tests.
+- Verified on the real model through the live server with the skill client: the 59 s full-mode song scored
+  PER 3.4 % / WER 4.3 % against its own lyrics (transcript matched every line but the cut-off last words;
+  two passes identical, so decoding is deterministic), and PER 212 % / CER 132 % against a wrong Mandarin
+  reference. Worker load ~20 s, then ~0.1 s per second of audio.
+
 **Phase 6: tests and router integration** (half a day)
 - `tests/test_api.py` with a fake pipeline object (same method names, emits a few tokens, honours `cancelled`),
   `tests/test_queue.py`, and the opt-in GPU smoke test.
@@ -571,6 +601,7 @@ What changed relative to the upstream skill:
 | `scripts/run_yue2.py` | Rewritten, stdlib only (`urllib`). Same subcommands (`generate`, `all-modes`, `plan`, `decode`) and same output layout (`invocation.json`, `input.json`, native artifacts, `abc_check.json`, `run.json`, `failure.json`) plus `job.json` with the server job id. Loader flags (`--model`, `--vae`, `--revision`, `--offline`, `--device`, `--memory-budget-gib`) replaced by `--server` (env `YUE2_SERVER`), `--wait-timeout`, `--max-wait`, `--http-timeout`, `--quiet`. Verifies downloads against `result.json` / `plan_manifest.json` with a stdlib port of `yue2.storage.verify_result`. Ctrl-C cancels the server job. |
 | `scripts/abc_tools.py`, `common.py` | Unchanged; already stdlib-only and operate on the same directory layout. |
 | `scripts/listen.py`, `references/listening-and-evaluation.md` | Removed; the HTML comparison page is not needed for this deployment. |
+| `scripts/lyrics.py` | New, stdlib only: `--source <run dir>` (server-side audio, reference from `request.json`) or an audio upload, `--lyrics-file`, `--language`, `--passes`; downloads and verifies `lyrics_asr.json`, `transcript.txt`. |
 | `scripts/transcribe.py` | Rewritten, stdlib only: multipart upload to `POST /jobs/transcribe`, same `--task/--preset/--max-seconds/--dtype` options, waits and downloads the worker's artifacts, verifies them against `transcription_manifest.json` and checks the manifest's source hash equals the uploaded file. Reuses the HTTP helpers from `run_yue2.py`. |
 | `SKILL.md` | Renamed `yue2-music-server`; "Set up the needed models" replaced by "Use the server through the helpers" (`YUE2_SERVER`, wait/cancel options); commands unchanged. Agents never call the HTTP API directly, so the skill carries no endpoint documentation; the contract below lives only in this plan and the tests. |
 | `references/generation-and-covers.md` | Header note: Python API examples describe what the server executes. |

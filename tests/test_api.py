@@ -27,7 +27,7 @@ def sha(data):
 def test_health(client):
     body = client.get("/health").json()
     assert body["status"] == "ok" and body["running"] is None and body["queued"] == 0
-    assert body["transcribe"] is True and body["decoders"] == ["standard"]
+    assert body["transcribe"] is True and body["lyrics"] is True and body["decoders"] == ["standard"]
 
 
 def test_generate_roundtrip(client, jq):
@@ -270,7 +270,7 @@ def test_keep_jobs_prunes_oldest(tmp_path, pipe, fake_models):
         ids = [wait_done(client, client.post("/jobs", json={**REQUEST, "cot": "off"}).json()["id"])["id"] for _ in range(3)]
         assert wait_until(lambda: client.get(f"/jobs/{ids[0]}").status_code == 404)
         assert [j["id"] for j in client.get("/jobs").json()] == [ids[2], ids[1]]
-        assert not (tmp_path / "out" / ids[0]).exists()
+        assert wait_until(lambda: not (tmp_path / "out" / ids[0]).exists())    # deleted after leaving the registry
 
 
 def test_first_measurement_replaces_prior(tmp_path):
@@ -286,3 +286,47 @@ def test_first_measurement_replaces_prior(tmp_path):
     assert reloaded.source == "measured" and reloaded.measured >= {"transcribe_load_s", "semantic_tok_s"}
     reloaded.update(transcribe_load_s=100.0)
     assert reloaded.get("transcribe_load_s") == pytest.approx(0.7 * 12.0 + 0.3 * 100.0)
+
+
+def test_lyrics_from_source_job(client, jq):
+    src = wait_done(client, client.post("/jobs", json=REQUEST).json()["id"])
+    r = client.post("/jobs", json={"task": "lyrics", "source_job": src["id"], "lyrics": REQUEST["lyrics"],
+                                   "language": "English", "passes": 3})
+    assert r.status_code == 202, r.text
+    view = wait_done(client, r.json()["id"])
+    assert view["status"] == "done", view
+    assert view["request"]["audio_seconds"] == pytest.approx(1.6) and view["request"]["passes"] == 3
+    assert set(view["artifacts"]) == {"model_provenance.json", "transcript.txt", "lyrics_asr.json", "lyrics_manifest.json"}
+    report = client.get(f"/jobs/{view['id']}/artifacts/lyrics_asr.json").json()
+    assert report["best_pass"] == 3 and report["per"] == pytest.approx(0.08)
+    assert (jq.get(view["id"]).dir / "reference_lyrics.txt").read_text() == REQUEST["lyrics"]
+    assert client.get(f"/jobs/{view['id']}/audio").status_code == 404
+    assert client.get(f"/jobs/{view['id']}/score").status_code == 404
+    # transcript only, no reference
+    r = client.post("/jobs", json={"task": "lyrics", "source_job": src["id"]})
+    view = wait_done(client, r.json()["id"])
+    assert view["status"] == "done"
+    report = client.get(f"/jobs/{view['id']}/artifacts/lyrics_asr.json").json()
+    assert report["per"] is None and report["reference"] is None
+
+
+def test_lyrics_upload_and_validation(client, jq):
+    wav = _wav_bytes()
+    r = client.post("/jobs/lyrics", files={"audio": ("song.wav", wav, "audio/wav")},
+                    data={"lyrics": "neon fades", "language": "auto", "passes": "2"})
+    assert r.status_code == 202, r.text
+    view = wait_done(client, r.json()["id"])
+    assert view["status"] == "done" and view["request"]["audio_seconds"] == 1.0
+    manifest = client.get(f"/jobs/{view['id']}/artifacts/lyrics_manifest.json").json()
+    assert manifest["source_audio_sha256"] == sha(wav)
+    assert not (jq.get(view["id"]).dir / "upload").exists()
+    assert client.post("/jobs/lyrics", files={"audio": ("s.wav", wav, "audio/wav")}, data={"passes": "9"}).status_code == 422
+    assert client.post("/jobs/lyrics", files={"audio": ("s.wav", wav, "audio/wav")}, data={"language": "klingon"}).status_code == 422
+    assert client.post("/jobs/lyrics", files={"audio": ("s.txt", b"x", "text/plain")}).status_code == 415
+    plan = wait_done(client, client.post("/jobs", json={**REQUEST, "task": "plan"}).json()["id"])
+    r = client.post("/jobs", json={"task": "lyrics", "source_job": plan["id"]})
+    assert r.status_code == 422 and "with audio" in r.text
+    assert client.post("/jobs", json={"task": "lyrics", "lyrics": "x"}).status_code == 422
+    jq.lyrics_enabled = False
+    assert client.post("/jobs/lyrics", files={"audio": ("s.wav", wav, "audio/wav")}).status_code == 422
+    assert client.get("/health").json()["lyrics"] is False

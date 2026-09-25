@@ -11,7 +11,7 @@ class SubmitRequest(BaseModel):
     """POST /jobs body. `generate` and `plan` take the YuE2 SongRequest fields; `decode` takes a source job."""
     model_config = ConfigDict(extra="forbid")
 
-    task: Literal["generate", "plan", "decode"] = "generate"
+    task: Literal["generate", "plan", "decode", "lyrics"] = "generate"
     style: str | None = None
     tags: str | None = None            # alias of style, as in the YuE2 CLI
     lyrics: str | None = None
@@ -22,6 +22,9 @@ class SubmitRequest(BaseModel):
     id: str = "song"
     abc_sampling: dict[str, Any] | None = None
     semantic_sampling: dict[str, Any] | None = None
-    # decode only
+    # decode and lyrics: a finished job whose audio.flac is the input
     source_job: str | None = None
     vae: Literal["standard", "legacy"] = "standard"
+    # lyrics only: reference text is `lyrics` above; language auto|English|Chinese; ASR passes
+    language: str = "auto"
+    passes: int = 1

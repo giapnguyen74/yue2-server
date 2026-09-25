@@ -4,28 +4,34 @@
 #
 #   ./setup.sh                  # YuE2-3B + YuE2-Vae + SheetSage2 + MERT-v2-FullSong, envs, doctor, dry run
 #   ./setup.sh --legacy         # also YuE2-Vae-legacy (benchmark-protocol decoder)
-#   ./setup.sh --no-transcribe  # generation only: skip SheetSage2/MERT and the worker environment
+#   ./setup.sh --no-transcribe  # skip SheetSage2/MERT and their worker environment
+#   ./setup.sh --no-lyrics      # skip Qwen3-ASR (sung-lyrics recognition, WER/PER) and its worker environment
 #   ./setup.sh --dry-run        # show what would be downloaded
 #   ./setup.sh --no-sync        # skip building the uv environments
 #   ./setup.sh --no-verify      # skip `yue2 doctor` and the dry run (no profile is written)
 #   ./setup.sh --load-only      # dry run loads the models but generates nothing
+#   ./setup.sh --import <dir>   # first link <dir>/<name>/ snapshots (hf --local-dir layout, e.g. a YuE
+#                               # checkout's models/) into the cache instead of downloading them
 #
 # Files already in the cache are skipped. HF_HOME / HF_HUB_CACHE / HF_TOKEN are respected.
 # Revisions are pinned in yue2_common.py; the server resolves exactly those snapshots.
 set -euo pipefail
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-legacy=0 transcribe=1 sync=1 verify=1 load_only=0
+legacy=0 transcribe=1 lyrics=1 sync=1 verify=1 load_only=0
 dry_run=()
+import_dir=""
 while (($#)); do
     case "$1" in
         --legacy) legacy=1; shift ;;
         --no-transcribe) transcribe=0; shift ;;
+        --no-lyrics) lyrics=0; shift ;;
         --dry-run) dry_run=(--dry-run); shift ;;
         --no-sync) sync=0; shift ;;
         --no-verify) verify=0; shift ;;
         --load-only) load_only=1; shift ;;
+        --import) [[ $# -ge 2 ]] || usage 1; import_dir=$2; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
     esac
@@ -51,11 +57,20 @@ fi
 names=()
 ((legacy)) && names+=(--legacy)
 ((transcribe)) && names+=(--transcribe)
+((lyrics)) && names+=(--lyrics)
 read -r -a models <<<"$(python3 yue2_common.py names "${names[@]}")"
 
+if [[ -n $import_dir ]]; then
+    echo "== importing local snapshots from $import_dir into the Hugging Face cache (hard links)"
+    python3 yue2_common.py import "$import_dir" "${models[@]}" || echo "   (models not imported are downloaded below)"
+fi
 for name in "${models[@]}"; do
     read -r repo revision files <<<"$(python3 yue2_common.py files "$name")"
     read -r -a file_list <<<"$files"
+    if cached=$(python3 yue2_common.py cached "$name"); then
+        echo "== $name: already in the cache ($cached)"
+        continue
+    fi
     echo "== $name: $repo @ ${revision:0:12} (${#file_list[@]} files)"
     # Explicit filenames: hf download fetches exactly these into the cache snapshot for that revision.
     hf download "$repo" "${file_list[@]}" --revision "$revision" "${dry_run[@]}" >/dev/null
@@ -69,6 +84,12 @@ if ((sync)); then
     if ((transcribe)); then
         echo "== uv sync --script workers/transcribe.py (SheetSage2: torch 2.8 cu128, transformers 4.45)"
         uv sync --script workers/transcribe.py --locked
+    fi
+    if ((lyrics)); then
+        echo "== uv sync --script workers/lyrics.py (Qwen3-ASR: torch 2.10, transformers 4.57.6, g2p_en, pypinyin)"
+        uv sync --script workers/lyrics.py --locked
+        echo "== nltk data for g2p_en (offline at run time)"
+        uv run --locked --script workers/lyrics.py --prepare
     fi
 fi
 

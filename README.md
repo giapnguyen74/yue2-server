@@ -2,7 +2,8 @@
 
 HTTP job server for [YuE2](https://github.com/multimodal-art-projection/YuE) song generation on one GPU.
 It loads `YuE2Pipeline` once, queues JSON requests, runs them one at a time, and serves the native
-artifacts by job id. SheetSage2 transcription (audio → ABC) is served through the same queue, so a client
+artifacts by job id. SheetSage2 transcription (audio → ABC) and Qwen3-ASR lyrics recognition (audio →
+transcript, WER/CER and PER against the intended lyrics) are served through the same queue, so a client
 needs no GPU, no torch and no model files. The `skills/yue2-music-server/` agent skill is the intended
 client; `scripts/yue2-client.sh` is the same contract in curl.
 
@@ -16,13 +17,23 @@ for transcription, and an NVIDIA driver for CUDA 12.8.
 ```bash
 ./setup.sh                 # pinned snapshots into the HF cache, both uv envs, doctor, dry run -> yue2_profile.json
 ./setup.sh --legacy        # also YuE2-Vae-legacy, the benchmark-protocol decoder
-./setup.sh --no-transcribe # generation only
+./setup.sh --no-transcribe # skip SheetSage2
+./setup.sh --no-lyrics     # skip Qwen3-ASR
 ./setup.sh --dry-run       # show what would be downloaded
 ```
 
-The pins live in `yue2_common.py` (the commits the YuE uv skill records). Snapshots already laid out as
-`<dir>/YuE2-3B`, `<dir>/YuE2-Vae`, ... (for example a YuE checkout's `models/`) can be used instead of the
-cache with `YUE2_MODELS_DIR=<dir>`.
+The pins live in `yue2_common.py` (the commits the YuE uv skill records). Snapshots you already have from
+`hf download --local-dir`, laid out as `<dir>/YuE2-3B`, `<dir>/YuE2-Vae`, ... (for example a YuE checkout's
+`models/`), go into the cache without a second download:
+
+```bash
+./setup.sh --import /path/to/YuE/models      # hard-links the files into the HF cache, then continues as usual
+```
+
+The importer reads each file's `--local-dir` metadata, refuses files from a commit other than the pin, and
+lays the cache out exactly as `hf` would (blobs by etag, symlinked snapshots), so `hf cache ls` shows them
+and a later `hf download` re-uses them. Alternatively point the server straight at such a directory with
+`YUE2_MODELS_DIR=<dir>`.
 
 The dry run loads and hash-verifies both checkpoints, generates a 20 s song, transcribes it with the
 SheetSage2 worker, and records the GPU, budget and measured rates in `yue2_profile.json`. Those rates are
@@ -47,6 +58,7 @@ Finished jobs are re-registered after a restart; `--keep-jobs N` prunes the olde
 |---|---|
 | `POST /jobs` | JSON `{task: generate \| plan \| decode, ...}`; `202` with `id`, `position`, `eta_s`, `seed` |
 | `POST /jobs/transcribe` | multipart `audio=@file` plus `task` (`full`, `melody-full`, `melody-vocal`), `preset`, `max_seconds`, `dtype` |
+| `POST /jobs/lyrics` | multipart `audio=@file` plus `lyrics` (reference text, optional), `language` (`auto`, `English`, `Chinese`), `passes` (1–8); or JSON `{task: lyrics, source_job, lyrics, language, passes}` to score a finished job's audio |
 | `GET /jobs/{id}` | `queued` / `running` / `done` / `failed` / `cancelled`, with `phase`, `tokens`, `eta_s`, and `artifacts` when done |
 | `GET /jobs/{id}/wait?timeout=300` | long-poll: returns when the job is terminal or after `timeout` seconds |
 | `GET /jobs/{id}/audio` | `audio.mp3` by default; `?format=flac` for the lossless artifact, `?format=wav`; `409` until done, `404` for plan/transcribe jobs |
@@ -54,6 +66,13 @@ Finished jobs are re-registered after a restart; `--keep-jobs N` prunes the olde
 | `GET /jobs/{id}/artifacts/{name}` | any file the status view lists under `artifacts`, unchanged |
 | `DELETE /jobs/{id}` | cancel a queued job, or stop a running one at its next token / ODE step |
 | `GET /jobs`, `GET /health` | all jobs newest first; `running` and `queued` for a router's busy check |
+
+`lyrics` jobs run Qwen3-ASR-1.7B, the model WildSongBench's PER evaluator uses, and write `transcript.txt`
+and `lyrics_asr.json` with every pass, the detected language, the unit error rate (WER for English, CER for
+Chinese) and the phoneme error rate against the reference. The scoring (lower-cased, section tags and
+punctuation dropped; ARPAbet via g2p_en for Latin words, tone-less pinyin initial+final for CJK) is
+documented in the report; it is not the benchmark's undisclosed evaluator, so compare versions with each
+other.
 
 `generate` and `plan` take the YuE2 request fields: `style` (alias `tags`), `lyrics`, `cot`
 (`full` \| `melody` \| `off`), `seed` (random when omitted), `abc` (a supplied score, needs `full` or
@@ -78,7 +97,9 @@ Phases of a `generate` job: `planning` (ABC tokens), `semantic` (codec tokens), 
 matching), `decoding` (VAE), `saving`. Cancellation lands within a token or ODE step; there is no hook
 inside the VAE decode, so a cancel there takes effect right after it. Transcription runs
 `workers/transcribe.py` as a subprocess in its own uv environment (torch 2.8, transformers 4.45) after
-moving the YuE2 model off the GPU; phases are `loading` and `transcribing`.
+moving the YuE2 model off the GPU; phases are `loading` and `transcribing`. Lyrics recognition runs
+`workers/lyrics.py` the same way (qwen-asr pins accelerate 1.12 against yue2-infer's 1.13); phases are
+`loading` and `recognizing`.
 
 ## Router
 
@@ -109,7 +130,7 @@ drives the skill's stdlib clients against a live uvicorn. `uv run yue2_dryrun.py
 | `yue2_schemas.py` | request body model |
 | `yue2_common.py` | model pins, offline resolve, GPU probe, profile |
 | `yue2_dryrun.py`, `setup.sh` | setup and real-model check |
-| `workers/` | SheetSage2 worker with its own lockfile (from the YuE uv skill) |
+| `workers/` | SheetSage2 worker (from the YuE uv skill) and the Qwen3-ASR lyrics worker, each with its own lockfile |
 | `skills/yue2-music-server/` | agent skill whose helpers call this server |
 | `scripts/yue2-client.sh` | curl/jq client |
 | `PLAN.md` | design notes and the HTTP contract |
@@ -117,4 +138,4 @@ drives the skill's stdlib clients against a live uvicorn. `uv run yue2_dryrun.py
 ## License
 
 Server code: Apache 2.0, like the YuE2 runtime and skill it wraps. YuE2, SheetSage2 and MERT weights are
-CC BY-NC 4.0 and keep their own terms.
+CC BY-NC 4.0 and keep their own terms; Qwen3-ASR is Apache 2.0.

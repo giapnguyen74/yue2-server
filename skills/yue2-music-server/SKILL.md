@@ -24,6 +24,7 @@ client machine needs no GPU, no torch and no model files.
 | Cover an ABC melody | Inspect/convert native ABC → strip chords → YuE2 `melody` |
 | Change harmony, instruments, tempo, structure, or lyrics | Copy full plan → edit ABC/text → regenerate |
 | Agentic editing | Export plan/baseline → bounded editing agent → check invariants → render → compare |
+| Check sung lyrics, lyric rewrite or translation | `lyrics.py` → Qwen3-ASR transcript → WER/CER and PER against the intended lyrics |
 | Analyze musical features | Use MERT2 only when continuous features are needed |
 
 ```text
@@ -148,6 +149,29 @@ Read [editing-workflows.md](references/editing-workflows.md) and
 For lyric translation, adapt syllables, stress, vowels and breath points. Keep a
 syllable/phoneme-to-note sidecar. Do not invent a `phonemes` field or mistake the sidecar
 for hard acoustic alignment. Use ASR/PER and listening as separate evidence.
+
+## Check the sung lyrics
+
+The server runs Qwen3-ASR (the model behind WildSongBench's PER metric; open weights,
+best published results on sung-lyrics benchmarks) and scores the transcript against the
+lyrics that were requested:
+
+```bash
+python scripts/lyrics.py --source outputs/jazz --output outputs/jazz-lyrics
+python scripts/lyrics.py --source outputs/translated --lyrics-file translated.txt \
+  --language Chinese --passes 4 --output outputs/translated-lyrics
+```
+
+`--source` reuses the server's copy of the audio and takes the reference from the run's
+`request.json`; `--lyrics-file` overrides it, and a plain audio path uploads instead.
+Read `lyrics_asr.json`: `per` (phoneme error rate, lower is better; the YuE2 benchmark's
+best systems sit around 6–10 %), `unit_error_rate` (WER for English, CER for Chinese),
+the detected language and every pass's transcript. `--passes N` keeps the lowest-PER pass,
+the shape of the benchmark protocol; the scoring itself is the documented one in the
+report's `scoring` field, not the benchmark's undisclosed evaluator, so compare versions
+against each other rather than against published tables. Inspect the transcript for the
+dropped or repeated words a scalar hides; a low PER on a translation says the new words are
+intelligible, not that they are good lyrics.
 
 ## Deliver an audible result
 

@@ -5,6 +5,7 @@
 
   POST   /jobs                 JSON {task: generate|plan|decode, ...}; 202 {id, status, position, eta_s}
   POST   /jobs/transcribe      multipart: audio=@file, task=full|melody-full|melody-vocal, preset, max_seconds, dtype
+  POST   /jobs/lyrics          multipart: audio=@file, lyrics (reference text), language, passes; or JSON task=lyrics with source_job
   GET    /jobs/{id}            status view; GET /jobs/{id}/wait?timeout=300 long-polls until terminal
   GET    /jobs/{id}/audio      audio.mp3 by default (?format=flac for the lossless artifact, ?format=wav)
   GET    /jobs/{id}/artifacts/{name}   any file the status view lists under "artifacts"
@@ -26,7 +27,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 
-from yue2_common import GENERATION, MODELS, choose_budget, probe_gpu, read_profile, resolve
+from yue2_common import GENERATION, LYRICS, MODELS, choose_budget, probe_gpu, read_profile, resolve
 from yue2_jobs import AUDIO_SUFFIXES, JobQueue, audio_duration, convert_mp3
 from yue2_schemas import SubmitRequest
 
@@ -65,12 +66,70 @@ def create_app(jq, settings):
         return {"id": job.id, "task": job.task, "status": job.status, "position": view["position"],
                 "eta_s": view["eta_s"], "seed": view["seed"]}
 
+    def lyrics_request(lyrics, language, passes):
+        if language.lower() not in ("auto", "english", "chinese"):
+            raise HTTPException(422, "language must be auto, English or Chinese")
+        if not 1 <= passes <= 8:
+            raise HTTPException(422, "passes must be 1-8")
+        if lyrics is not None and not lyrics.strip():
+            lyrics = None
+        return {"lyrics": lyrics, "language": language, "passes": passes}
+
+    async def save_upload(job, audio):
+        name = Path(audio.filename or "audio").name
+        if Path(name).suffix.lower() not in AUDIO_SUFFIXES:
+            shutil.rmtree(job.dir, ignore_errors=True)
+            raise HTTPException(415, f"unsupported audio type; use one of {sorted(AUDIO_SUFFIXES)}")
+        target = job.dir / "upload" / name
+        target.parent.mkdir(parents=True)
+        size = 0
+        try:
+            with target.open("wb") as stream:
+                while chunk := await audio.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > max_upload:
+                        raise HTTPException(413, f"audio exceeds {settings.get('max_upload_mb', 200)} MB")
+                    stream.write(chunk)
+            if size == 0:
+                raise HTTPException(422, "empty upload")
+        except HTTPException:
+            shutil.rmtree(job.dir, ignore_errors=True)
+            raise
+        job.request["filename"] = name
+        job.request["bytes"] = size
+        duration = audio_duration(target)
+        if duration:
+            job.request["audio_seconds"] = round(duration, 1)
+        return job
+
+    @app.post("/jobs/lyrics", status_code=202)
+    async def lyrics(audio: UploadFile = File(...), lyrics: str | None = Form(None), language: str = Form("auto"),
+                     passes: int = Form(1)):
+        if not jq.lyrics_enabled:
+            raise HTTPException(422, "lyrics recognition is not enabled on this server")
+        job = jq.new_job("lyrics", lyrics_request(lyrics, language, passes))
+        return accepted(jq.submit(await save_upload(job, audio)))
+
     @app.post("/jobs", status_code=202)
     def submit(req: SubmitRequest):
         from yue2.protocol import SongRequest, resolve_sampling, GenerationConfig
         body = req.model_dump()
         task = body.pop("task")
         source_job, vae = body.pop("source_job"), body.pop("vae")
+        language, passes = body.pop("language"), body.pop("passes")
+        if task == "lyrics":
+            if not jq.lyrics_enabled:
+                raise HTTPException(422, "lyrics recognition is not enabled on this server")
+            if not source_job:
+                raise HTTPException(422, "lyrics as JSON needs source_job; upload audio to /jobs/lyrics instead")
+            source = jq.get(source_job)
+            if source is None or source.status != "done" or not (source.artifact_root / "audio.flac").is_file():
+                raise HTTPException(422, "source_job must be a finished job with audio")
+            request = lyrics_request(body.get("lyrics"), language, passes)
+            request["source_job"] = source_job
+            if source.result and source.result.get("audio_seconds"):
+                request["audio_seconds"] = source.result["audio_seconds"]
+            return accepted(jq.submit(jq.new_job("lyrics", request)))
         if task == "decode":
             if not source_job:
                 raise HTTPException(422, "decode needs source_job")
@@ -118,32 +177,8 @@ def create_app(jq, settings):
             raise HTTPException(422, "preset must be default|paper and dtype bf16|fp32")
         if max_seconds is not None and max_seconds <= 0:
             raise HTTPException(422, "max_seconds must be positive")
-        name = Path(audio.filename or "audio").name
-        if Path(name).suffix.lower() not in AUDIO_SUFFIXES:
-            raise HTTPException(415, f"unsupported audio type; use one of {sorted(AUDIO_SUFFIXES)}")
-        job = jq.new_job("transcribe", {"filename": name, "task": task, "preset": preset,
-                                        "max_seconds": max_seconds, "dtype": dtype})
-        target = job.dir / "upload" / name
-        target.parent.mkdir(parents=True)
-        size = 0
-        try:
-            with target.open("wb") as stream:
-                while chunk := await audio.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > max_upload:
-                        raise HTTPException(413, f"audio exceeds {settings.get('max_upload_mb', 200)} MB")
-                    stream.write(chunk)
-        except HTTPException:
-            shutil.rmtree(job.dir, ignore_errors=True)
-            raise
-        if size == 0:
-            shutil.rmtree(job.dir, ignore_errors=True)
-            raise HTTPException(422, "empty upload")
-        job.request["bytes"] = size
-        duration = audio_duration(target)
-        if duration:
-            job.request["audio_seconds"] = round(duration, 1)
-        return accepted(jq.submit(job))
+        job = jq.new_job("transcribe", {"task": task, "preset": preset, "max_seconds": max_seconds, "dtype": dtype})
+        return accepted(jq.submit(await save_upload(job, audio)))
 
     @app.get("/jobs")
     def list_jobs():
@@ -240,6 +275,7 @@ def main():
     ap.add_argument("--max-upload-mb", type=int, default=200)
     ap.add_argument("--no-warmup", action="store_true", help="do not move the 3B model to the GPU before the first job")
     ap.add_argument("--no-transcribe", action="store_true", help="refuse transcription jobs")
+    ap.add_argument("--no-lyrics", action="store_true", help="refuse lyrics recognition (Qwen3-ASR) jobs")
     ap.add_argument("--progress", action="store_true", help="show YuE2's own stderr progress lines")
     args = ap.parse_args()
 
@@ -266,8 +302,17 @@ def main():
             print("transcription disabled: uv not on PATH", flush=True)
             transcribe = False
 
+    lyrics = not args.no_lyrics
+    if lyrics:
+        try:
+            resolve(LYRICS[0])
+        except FileNotFoundError as exc:
+            print(f"lyrics recognition disabled: {exc}", flush=True)
+            lyrics = False
+        if lyrics and not shutil.which("uv"):
+            lyrics = False
     jq = JobQueue(pipe, out_dir=args.output_dir, gpu=gpu_name, profile=profile, vae=args.vae,
-                  keep_jobs=args.keep_jobs, transcribe=transcribe, legacy_vae=legacy)
+                  keep_jobs=args.keep_jobs, transcribe=transcribe, lyrics=lyrics, legacy_vae=legacy)
     static = {
         "gpu": gpu_name, "vram_gib": round(total, 1), "budget_gib": budget, "vae": args.vae,
         "models": {name: {"repo": MODELS[name][0], "revision": MODELS[name][1]} for name in GENERATION},

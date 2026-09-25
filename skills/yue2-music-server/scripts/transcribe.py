@@ -37,9 +37,10 @@ def multipart(fields, file_field, path):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def submit_transcription(server, audio, fields, timeout):
+def submit_upload(server, path, audio, fields, timeout):
+    """POST an audio file plus text fields as multipart to <server><path>; returns the 202 body."""
     data, content_type = multipart(fields, "audio", audio)
-    request = urllib.request.Request(server.base + "/jobs/transcribe", data=data, method="POST")
+    request = urllib.request.Request(server.base + path, data=data, method="POST")
     request.add_header("content-type", content_type)
     request.add_header("accept", "application/json")
     try:
@@ -51,9 +52,9 @@ def submit_transcription(server, audio, fields, timeout):
             detail = json.loads(detail).get("detail", detail)
         except ValueError:
             pass
-        raise ServerError(f"POST /jobs/transcribe -> {error.code}: {detail}") from None
+        raise ServerError(f"POST {path} -> {error.code}: {detail}") from None
     except urllib.error.URLError as error:
-        raise ServerError(f"POST /jobs/transcribe: cannot reach {server.base} ({error.reason})") from None
+        raise ServerError(f"POST {path}: cannot reach {server.base} ({error.reason})") from None
 
 
 def run(args):
@@ -70,7 +71,7 @@ def run(args):
         "server": server.base, "health": health, "options": fields,
     })
     try:
-        submitted = submit_transcription(server, args.audio, fields, timeout=args.upload_timeout)
+        submitted = submit_upload(server, "/jobs/transcribe", args.audio, fields, timeout=args.upload_timeout)
         job_id = submitted["id"]
         write_json(output / "job.json", {"server": server.base, "id": job_id, "task": "transcribe", "submitted": submitted})
         try:

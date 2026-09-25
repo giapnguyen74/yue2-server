@@ -24,14 +24,15 @@ from pathlib import Path
 
 import numpy as np
 
-from yue2_common import HERE, MODELS, TRANSCRIBE_WORKER, TRANSCRIPTION, offline_env, resolve
+from yue2_common import HERE, LYRICS, LYRICS_WORKER, MODELS, TRANSCRIBE_WORKER, TRANSCRIPTION, offline_env, resolve
 
 TERMINAL = {"done", "failed", "cancelled"}
 TIMING_FILE = HERE / "yue2_timing.json"
 # Before any measurement. The dry run (yue2_profile.json) replaces most of these on first start.
 PRIORS = {"abc_tok_s": 30.0, "semantic_tok_s": 30.0, "nar_s_per_token": 0.02, "vae_s_per_token": 0.004,
           "overhead_s": 15.0, "abc_len": 1500.0, "semantic_len": 6000.0,
-          "transcribe_load_s": 45.0, "transcribe_s_per_audio_s": 0.2}
+          "transcribe_load_s": 45.0, "transcribe_s_per_audio_s": 0.2,
+          "lyrics_load_s": 30.0, "lyrics_s_per_audio_s": 0.1}
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus", ".aac"}
 MP3_QUALITY = "2"        # libmp3lame VBR level: ~190 kbit/s
 
@@ -69,7 +70,11 @@ class Job:
 
     @property
     def artifact_root(self):
-        return self.dir / "transcription" if self.task == "transcribe" else self.dir
+        if self.task == "transcribe":
+            return self.dir / "transcription"
+        if self.task == "lyrics":
+            return self.dir / "lyrics"
+        return self.dir
 
     @property
     def terminal(self):
@@ -147,7 +152,7 @@ class Timing:
 class JobQueue:
     def __init__(self, pipe, *, out_dir, gpu=None, profile=None, vae="standard", keep_jobs=0,
                  timing_path=TIMING_FILE, worker=TRANSCRIBE_WORKER, worker_command=None, transcribe=True,
-                 legacy_vae=None, start_worker=True):
+                 lyrics_worker=LYRICS_WORKER, lyrics=True, legacy_vae=None, start_worker=True):
         self.pipe = pipe
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -156,6 +161,8 @@ class JobQueue:
         self.worker_script = Path(worker)
         self.worker_command = list(worker_command or ["uv", "run", "--locked", "--script"])
         self.transcribe_enabled = transcribe
+        self.lyrics_worker = Path(lyrics_worker)
+        self.lyrics_enabled = lyrics
         self.legacy_vae = legacy_vae            # Path or None
         self._legacy_identity = None
         self.timing = Timing(gpu, timing_path, profile)
@@ -246,7 +253,7 @@ class JobQueue:
         return {"running": self.running, "queued": queued, "jobs": len(self.jobs),
                 "timing": dict(self.timing.values), "eta_source": self.timing.source,
                 "decoders": ["standard"] + (["legacy"] if self.legacy_vae else []),
-                "transcribe": self.transcribe_enabled}
+                "transcribe": self.transcribe_enabled, "lyrics": self.lyrics_enabled}
 
     # ── ETA ───────────────────────────────────────────────────────────────────
 
@@ -270,6 +277,8 @@ class JobQueue:
             return t("overhead_s") + req.get("frames", t("semantic_len")) * t("vae_s_per_token") * 1.5
         if job.task == "transcribe":
             return t("transcribe_load_s") + req.get("audio_seconds", 240.0) * t("transcribe_s_per_audio_s")
+        if job.task == "lyrics":
+            return t("lyrics_load_s") + req.get("audio_seconds", 240.0) * t("lyrics_s_per_audio_s") * req.get("passes", 1)
         return 0.0
 
     def _remaining(self, job):
@@ -300,10 +309,12 @@ class JobQueue:
             return remaining + 3.0
         if job.task == "decode":
             return max(self._expected(job) - (now - job.started), 5.0)
-        if job.task == "transcribe":
+        if job.task in ("transcribe", "lyrics"):
+            prefix = job.task
+            work = req.get("audio_seconds", 240.0) * t(f"{prefix}_s_per_audio_s") * (req.get("passes", 1) if job.task == "lyrics" else 1)
             if job.phase == "loading":
-                return max(t("transcribe_load_s") - in_phase, 2.0) + req.get("audio_seconds", 240.0) * t("transcribe_s_per_audio_s")
-            return max(req.get("audio_seconds", 240.0) * t("transcribe_s_per_audio_s") - in_phase, 2.0)
+                return max(t(f"{prefix}_load_s") - in_phase, 2.0) + work
+            return max(work - in_phase, 2.0)
         return 0.0
 
     def eta(self, job):
@@ -332,7 +343,8 @@ class JobQueue:
                 job.status, job.started, self.running = "running", _now(), job.id
             try:
                 runner = {"generate": self._run_generate, "plan": self._run_generate,
-                          "decode": self._run_decode, "transcribe": self._run_transcribe}[job.task]
+                          "decode": self._run_decode, "transcribe": self._run_transcribe,
+                          "lyrics": self._run_lyrics}[job.task]
                 runner(job)
                 self._finish(job, "done", None)
             except InterruptedError as exc:
@@ -541,26 +553,54 @@ class JobQueue:
 
     def _run_transcribe(self, job):
         req = job.request
-        upload = job.dir / "upload" / req["filename"]
-        out = job.artifact_root
-        if out.exists():
-            shutil.rmtree(out)
         paths = {name: resolve(name) for name in TRANSCRIPTION}
-        command = [*self.worker_command, str(self.worker_script), str(upload),
-                   "--output", str(out), "--task", req["task"], "--preset", req["preset"],
+        command = [*self.worker_command, str(self.worker_script), str(self._input_audio(job)),
+                   "--output", str(job.artifact_root), "--task", req["task"], "--preset", req["preset"],
                    "--dtype", req["dtype"], "--offline", "--device", "cuda",
                    "--model", str(paths["SheetSage2"]), "--base-model", str(paths["MERT-v2-FullSong"])]
         if req.get("max_seconds"):
             command += ["--max-seconds", str(req["max_seconds"])]
+        manifest = self._run_worker(job, command, "transcription_manifest.json", "transcribe")
+        job.result = {"warnings": manifest.get("warnings", []), "timing": job.result["timing"]}
+
+    def _run_lyrics(self, job):
+        req = job.request
+        model = resolve(LYRICS[0])
+        command = [*self.worker_command, str(self.lyrics_worker), str(self._input_audio(job)),
+                   "--output", str(job.artifact_root), "--model", str(model), "--language", req.get("language", "auto"),
+                   "--passes", str(req.get("passes", 1)), "--offline", "--device", "cuda:0"]
+        reference = job.dir / "reference_lyrics.txt"
+        if req.get("lyrics"):
+            reference.write_text(req["lyrics"], encoding="utf-8")
+            command += ["--lyrics-file", str(reference)]
+        self._run_worker(job, command, "lyrics_manifest.json", "lyrics")
+        report = json.loads((job.artifact_root / "lyrics_asr.json").read_text())
+        job.result = {"per": report.get("per"), "unit_error_rate": report.get("unit_error_rate"),
+                      "language_detected": report.get("language_detected"), "transcript": report["passes"][report["best_pass"] - 1]["text"],
+                      "audio_seconds": report.get("audio_seconds"), "timing": job.result["timing"]}
+
+    def _input_audio(self, job):
+        """The uploaded file, or the source job's audio.flac for jobs submitted with source_job."""
+        req = job.request
+        if req.get("source_job"):
+            source = self.jobs[req["source_job"]]
+            return source.artifact_root / "audio.flac"
+        return job.dir / "upload" / req["filename"]
+
+    def _run_worker(self, job, command, manifest_name, timing_prefix):
+        """Run a worker subprocess in its own uv environment; return its manifest on success."""
+        out = job.artifact_root
+        if out.exists():
+            shutil.rmtree(out)
         self._offload_mot()
         self._phase(job, "loading")
         log = (job.dir / "worker.log").open("w")
         start = time.perf_counter()
+        loaded_at = None
         try:
             proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=offline_env(), cwd=str(HERE))
             with self.lock:
                 job.proc = proc
-            loaded_at = None
             while proc.poll() is None:
                 if job.cancel.is_set():
                     proc.terminate()
@@ -568,10 +608,10 @@ class JobQueue:
                         proc.wait(10)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                    raise InterruptedError("Cancelled during transcription")
+                    raise InterruptedError(f"Cancelled during {job.task}")
                 if loaded_at is None and (out / "model_provenance.json").is_file():
                     loaded_at = time.perf_counter()
-                    self._phase(job, "transcribing")
+                    self._phase(job, "transcribing" if job.task == "transcribe" else "recognizing")
                 time.sleep(0.5)
         finally:
             log.close()
@@ -580,20 +620,21 @@ class JobQueue:
             shutil.rmtree(job.dir / "upload", ignore_errors=True)
         if job.cancel.is_set():
             # cancel() may have terminated the process before the loop saw the flag.
-            raise InterruptedError("Cancelled during transcription")
-        manifest_path = out / "transcription_manifest.json"
+            raise InterruptedError(f"Cancelled during {job.task}")
+        manifest_path = out / manifest_name
         if proc.returncode == 0 and manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text())
             if manifest.get("status") == "complete":
                 total = time.perf_counter() - start
                 if loaded_at is not None:
-                    self.timing.update(transcribe_load_s=loaded_at - start)
-                    if req.get("audio_seconds"):
-                        self.timing.update(transcribe_s_per_audio_s=(time.perf_counter() - loaded_at) / req["audio_seconds"])
-                job.artifacts = sorted(manifest.get("artifacts", {})) + ["transcription_manifest.json"]
-                job.result = {"warnings": manifest.get("warnings", []), "timing": {"e2e_seconds": total,
-                              "load_seconds": (loaded_at - start) if loaded_at else None}}
-                return
+                    self.timing.update(**{f"{timing_prefix}_load_s": loaded_at - start})
+                    audio_seconds = job.request.get("audio_seconds")
+                    if audio_seconds:
+                        passes = job.request.get("passes", 1) if job.task == "lyrics" else 1
+                        self.timing.update(**{f"{timing_prefix}_s_per_audio_s": (time.perf_counter() - loaded_at) / (audio_seconds * passes)})
+                job.artifacts = sorted(manifest.get("artifacts", {})) + [manifest_name]
+                job.result = {"timing": {"e2e_seconds": total, "load_seconds": (loaded_at - start) if loaded_at else None}}
+                return manifest
         error = None
         failure = out / "failure.json"
         if failure.is_file():

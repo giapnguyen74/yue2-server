@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from conftest import FAKE_WORKER, FakePipeline
+from conftest import FAKE_LYRICS_WORKER, FAKE_WORKER, FakePipeline
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skills" / "yue2-music-server"
@@ -35,7 +35,7 @@ def server(tmp_path, fake_models):
     from yue2_jobs import JobQueue
     from yue2_server import create_app
     jq = JobQueue(FakePipeline(tmp_path), out_dir=tmp_path / "out", gpu="fake", timing_path=tmp_path / "t.json",
-                  worker=FAKE_WORKER, worker_command=[sys.executable])
+                  worker=FAKE_WORKER, worker_command=[sys.executable], lyrics_worker=FAKE_LYRICS_WORKER)
     app = create_app(jq, {"static": {"gpu": "fake"}, "max_upload_mb": 5})
     port = free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
@@ -122,3 +122,26 @@ def test_transcribe_client(server, tmp_path):
     proc = run_script("run_yue2.py", "generate", "--request", SKILL / "assets" / "prompt.json", "--cot", "melody",
                       "--abc-file", tmp_path / "cover.abc", "--output", tmp_path / "cover", env={"YUE2_SERVER": url})
     assert proc.returncode == 0, proc.stderr + proc.stdout
+
+
+def test_lyrics_client(server, tmp_path):
+    url, _ = server
+    env = {"YUE2_SERVER": url}
+    out = tmp_path / "song"
+    proc = run_script("run_yue2.py", "generate", "--request", SKILL / "assets" / "prompt.json", "--output", out, env=env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    # --source: the reference comes from the run's request.json, the audio from the server's copy.
+    proc = run_script("lyrics.py", "--source", out, "--output", tmp_path / "check", "--passes", "2", env=env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    summary = json.loads((tmp_path / "check" / "run.json").read_text())
+    assert summary["status"] == "complete" and summary["best_pass"] == 2 and summary["per"] == pytest.approx(0.10)
+    assert (tmp_path / "check" / "transcript.txt").is_file() and (tmp_path / "check" / "lyrics_asr.json").is_file()
+    # upload path with an explicit translated reference
+    ref = tmp_path / "translated.txt"
+    ref.write_text("[Verse]\n霓虹褪去\n")
+    proc = run_script("lyrics.py", out / "audio.flac", "--lyrics-file", ref, "--language", "Chinese",
+                      "--output", tmp_path / "check2", env=env)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert json.loads((tmp_path / "check2" / "input.json").read_text())["options"]["language"] == "Chinese"
+    proc = run_script("lyrics.py", "--output", tmp_path / "check3", env=env)
+    assert proc.returncode == 2 and "exactly one" in proc.stderr

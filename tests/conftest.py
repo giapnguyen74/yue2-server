@@ -102,6 +102,7 @@ class FakePipeline:
 
 
 FAKE_WORKER = ROOT / "tests" / "fake_transcribe_worker.py"
+FAKE_LYRICS_WORKER = ROOT / "tests" / "fake_lyrics_worker.py"
 
 
 @pytest.fixture
@@ -109,7 +110,7 @@ def fake_models(monkeypatch, tmp_path):
     """resolve() answers with empty directories so no Hugging Face cache is needed."""
     import yue2_jobs
     paths = {}
-    for name in ("SheetSage2", "MERT-v2-FullSong", "YuE2-Vae-legacy"):
+    for name in ("SheetSage2", "MERT-v2-FullSong", "YuE2-Vae-legacy", "Qwen3-ASR-1.7B"):
         path = tmp_path / "models" / name
         path.mkdir(parents=True)
         (path / "config.json").write_text(json.dumps({"release_variant": "legacy" if "legacy" in name else None}))
@@ -127,7 +128,8 @@ def pipe(tmp_path):
 def jq(tmp_path, pipe, fake_models):
     from yue2_jobs import JobQueue
     return JobQueue(pipe, out_dir=tmp_path / "outputs", gpu="fake", timing_path=tmp_path / "timing.json",
-                    worker=FAKE_WORKER, worker_command=[sys.executable], transcribe=True, legacy_vae=None)
+                    worker=FAKE_WORKER, worker_command=[sys.executable], transcribe=True,
+                    lyrics_worker=FAKE_LYRICS_WORKER, lyrics=True, legacy_vae=None)
 
 
 @pytest.fixture
