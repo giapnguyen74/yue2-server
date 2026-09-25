@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# yue2-server
+yue2_profile.json
+outputs/
+models/

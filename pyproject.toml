@@ -1,0 +1,19 @@
+[project]
+name = "yue2-server"
+version = "0.1.0"
+description = "YuE2 song-generation HTTP job server (text/ABC -> song, audio -> ABC) for one GPU"
+requires-python = "==3.12.*"
+dependencies = [
+    # Same commit as ../YuE and the yue2-music uv skill: torch 2.10.0, transformers 4.57.6.
+    "yue2-infer @ git+https://github.com/multimodal-art-projection/YuE@92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "httpx"]
+
+[tool.uv]
+package = false
